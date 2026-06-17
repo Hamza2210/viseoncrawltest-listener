@@ -1,50 +1,53 @@
 /**
- * Schema-change detector (in-path) + a Durable Object that accumulates the changed
- * URLs and flushes them to /enqueue-singlepage on a Cron Trigger.
+ * Schema-change detector (in-path) + a Durable Object coordinator.
  * ----------------------------------------------------------------------------
- * THREE pieces in one Worker:
+ * Pieces:
  *
  *   fetch()            — in-path detector. Proxies each request to origin and returns
- *                        it UNTOUCHED, then inspects a clone in the background
- *                        (ctx.waitUntil) so visitors get zero added latency. Extracts
- *                        the page's JSON-LD, canonicalises + hashes it, and hands the
- *                        {url, hash} pair to the coordinator Durable Object.
+ *                        it UNTOUCHED, then inspects a clone in the background. On a
+ *                        real JSON-LD change it hands {url, hash} to the coordinator DO.
+ *                        Also exposes a small authenticated control route for the seeder
+ *                        (see "/__schema-seed" below).
  *
  *   SchemaCoordinator  — the Durable Object. ONE strongly-consistent, single-threaded
- *                        instance owns ALL state: the per-URL last-seen hashes AND the
- *                        pending list. Because it is single-threaded and transactional,
- *                        the compare-and-set and the dedup are race-free (no KV eventual
- *                        consistency, no cross-colo duplicates). It also performs the
- *                        flush, so reading the pending list and POSTing it is atomic.
+ *                        instance owns ALL state: per-URL hashes, the pending list, and
+ *                        the seeder's cursor. Pure storage — no network I/O lives here.
  *
- *   scheduled()        — runs on the Cron Trigger and just pokes the DO's flush().
- *                        The cron interval is your "every x" flush window.
+ *   scheduled()        — the Cron Trigger. Each tick: (1) run one SEED batch if the
+ *                        initial baseline pass isn't finished, then (2) flush the pending
+ *                        list. The seed step is a no-op once seeding is complete.
+ *
+ * SEEDING (the baseline pass):
+ *   The in-path detector can only hash pages that actually receive traffic. To baseline
+ *   a whole domain without hand-visiting every page, the seeder reads your master URL
+ *   list (all_urls.json at S3_URLS_KEY), fetches each URL through the SAME hash path the
+ *   detector uses, and writes a baseline-only hash to the DO (never enqueues). Run it
+ *   with ENQUEUE_NEW_PAGES="false". Once it reports done, flip ENQUEUE_NEW_PAGES="true"
+ *   and only genuinely-new pages (absent from the seed) will fire from then on.
  *
  * Set RESERVED CONCURRENCY = 1 on the singlepage Lambda so two parquet merges never
  * overlap (the endpoint invokes the Lambda asynchronously).
- *
- * NOTE: adding a Durable Object means this Worker needs a migration (see wrangler.toml)
- * and is deployed via Wrangler — which is exactly what the GitHub -> Cloudflare build
- * integration runs for you on every push.
  */
 
 import { DurableObject } from "cloudflare:workers";
+import { AwsClient } from "aws4fetch";
 
 // --- Tunables ---------------------------------------------------------------
 const THROTTLE_SECONDS = 300; // re-inspect any one URL at most once / 5 min (per colo)
-const MAX_BATCH = 10;         // URLs per endpoint call (one Lambda run). Overflow waits
-                              //   for the next cron run. NOTE: with an hourly cron this
-                              //   caps you at MAX_BATCH changes flushed per hour — raise
-                              //   it if a single site can change more than that hourly.
+const MAX_BATCH = 10;         // URLs flushed to the endpoint per cron tick (one Lambda run)
+
+const SEED_BATCH = 100;       // URLs scanned per cron tick during the baseline pass
+const SEED_CONCURRENCY = 10;  // parallel page fetches within a seed batch
 
 const HASH_PREFIX = "hash:";       // hash:<sha(url)>     -> last-seen schema hash
 const PENDING_PREFIX = "pending:"; // pending:<sha(url)>  -> changed URL awaiting flush
+const SEED_CURSOR_KEY = "seed:cursor"; // how far through all_urls.json we've scanned
+const SEED_TOTAL_KEY = "seed:total";   // length of the list at last commit
+const SEED_DONE_KEY = "seed:done";     // true once cursor has covered the whole list
 
-// One coordinator instance per deployment. fetch() and scheduled() both resolve to the
-// same DO via this name, so all inspection traffic and the flush hit the same state.
-const DO_NAME = "coordinator";
+const DO_NAME = "coordinator"; // one coordinator instance per deployment
 
-// --- Request identity (must match the crawler / Lambda for allowlisting) ----
+// --- Request identity (matches the crawler / Lambda for origin allowlisting) ----
 function crawlerHeaders(env) {
   return {
     "User-Agent":
@@ -107,8 +110,54 @@ async function sha256Hex(str) {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+// --- Fetch a page and compute its schema hash (the shared hash path) --------
+// Used by BOTH the in-path detector (indirectly) and the seeder, so baselines match
+// exactly what live traffic produces. Returns { url (normalised), hash } or throws.
+async function hashPage(rawUrl, env) {
+  const url = normalizeUrl(rawUrl);
+  if (!url) return null;
+  // Fetching a URL on this same zone goes to ORIGIN, not back through this Worker,
+  // so there's no loop and the in-path detector isn't re-triggered.
+  const res = await fetch(url, { headers: crawlerHeaders(env) });
+  if (!res.ok) throw new Error(`fetch ${res.status}`);
+  const hash = await sha256Hex(canonicalizeBlocks(await extractJsonLd(res)));
+  return { url, hash };
+}
+
+// --- Read the master URL list (all_urls.json) from S3 via SigV4 -------------
+async function readAllUrls(env) {
+  const aws = new AwsClient({
+    accessKeyId: env.AWS_ACCESS_KEY,
+    secretAccessKey: env.AWS_SECRET_KEY,
+    region: env.AWS_REGION,
+    service: "s3",
+  });
+  // Virtual-hosted-style endpoint. If your bucket name contains dots, switch to
+  // path-style: `https://s3.${env.AWS_REGION}.amazonaws.com/${env.S3_BUCKET}/${env.S3_URLS_KEY}`
+  const endpoint =
+    `https://${env.S3_BUCKET}.s3.${env.AWS_REGION}.amazonaws.com/${env.S3_URLS_KEY}`;
+  const res = await aws.fetch(endpoint, { method: "GET" });
+  if (!res.ok) throw new Error(`S3 GET ${res.status} for ${env.S3_URLS_KEY}`);
+  const data = await res.json();
+  if (!Array.isArray(data)) throw new Error("all_urls.json is not a JSON array of URLs");
+  return data.filter((u) => typeof u === "string" && u.trim());
+}
+
+// --- Bounded-concurrency map (cap simultaneous page fetches) ----------------
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let i = 0;
+  const lanes = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) {
+      const idx = i++;
+      out[idx] = await fn(items[idx]);
+    }
+  });
+  await Promise.all(lanes);
+  return out;
+}
+
 // --- Flush the pending list to the endpoint ---------------------------------
-// Module-level so the Durable Object can call it (it has env). Same wire format as before.
 async function postBatch(urls, env) {
   try {
     const resp = await fetch(env.ENDPOINT_URL, {
@@ -144,67 +193,113 @@ async function postBatch(urls, env) {
 }
 
 // ----------------------------------------------------------------------------
-// Durable Object: the single source of truth.
+// Durable Object: the single source of truth. Pure storage, no network.
 // ----------------------------------------------------------------------------
 export class SchemaCoordinator extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
-    this.storage = ctx.storage; // transactional, strongly-consistent per-object storage
+    this.storage = ctx.storage;
     this.env = env;
   }
 
-  /**
-   * Authoritative compare-and-set for ONE URL's schema hash. Called via RPC from the
-   * in-path fetch handler (which has already throttled per-colo). Because the DO is
-   * single-threaded, this whole method runs without interleaving from other requests,
-   * so the read/compare/write is atomic — no KV race, no duplicate enqueues.
-   */
+  // In-path detector path: atomic compare-and-set + pending write.
   async record(url, hash) {
-    const urlKey = await sha256Hex(url); // stable, fixed-length storage key suffix
+    const urlKey = await sha256Hex(url);
     const stored = await this.storage.get(HASH_PREFIX + urlKey);
 
-    if (stored === hash) return;                          // unchanged -> nothing to do
-    await this.storage.put(HASH_PREFIX + urlKey, hash);   // persist new baseline
+    if (stored === hash) return;                          // unchanged
+    await this.storage.put(HASH_PREFIX + urlKey, hash);   // persist baseline
 
-    // First time we've ever seen this URL. DO storage returns `undefined` (not null)
-    // for a missing key. ENQUEUE_NEW_PAGES (default "true") decides whether a brand-new
-    // page counts as content worth enqueuing.
+    // First-ever sighting. DO storage returns `undefined` for a missing key.
     if (stored === undefined && this.env.ENQUEUE_NEW_PAGES === "false") return;
 
-    // Add to the pending list. Same URL -> same key -> deduped automatically.
-    await this.storage.put(PENDING_PREFIX + urlKey, url);
+    await this.storage.put(PENDING_PREFIX + urlKey, url); // dedup by key
   }
 
-  /**
-   * Drain up to MAX_BATCH pending URLs and POST them. Reading the list, POSTing, and
-   * deleting all happen inside this one single-threaded turn, so a concurrent record()
-   * can't slip a URL in between the read and the delete and lose it.
-   */
+  // Seeder support -----------------------------------------------------------
+
+  async seedState() {
+    const cursor = (await this.storage.get(SEED_CURSOR_KEY)) || 0;
+    const total = (await this.storage.get(SEED_TOTAL_KEY)) || 0;
+    const done = (await this.storage.get(SEED_DONE_KEY)) === true;
+    return { cursor, total, done };
+  }
+
+  // Of the given (already-normalised) URLs, return only those with NO baseline yet.
+  // Lets the seeder skip pages live traffic has already baselined — no wasted fetch.
+  async unbaselined(urls) {
+    const out = [];
+    for (const url of urls) {
+      const has = await this.storage.get(HASH_PREFIX + (await sha256Hex(url)));
+      if (has === undefined) out.push(url);
+    }
+    return out;
+  }
+
+  // Write baseline hashes (NEVER enqueues) and advance the cursor. Returns done flag.
+  async commitSeed(pairs, newCursor, total) {
+    for (const { url, hash } of pairs) {
+      await this.storage.put(HASH_PREFIX + (await sha256Hex(url)), hash);
+    }
+    const done = newCursor >= total;
+    await this.storage.put(SEED_CURSOR_KEY, newCursor);
+    await this.storage.put(SEED_TOTAL_KEY, total);
+    await this.storage.put(SEED_DONE_KEY, done);
+    return done;
+  }
+
+  // Re-run the baseline pass from the top (e.g. after adding many new pages).
+  async resetSeed() {
+    await this.storage.delete([SEED_CURSOR_KEY, SEED_TOTAL_KEY, SEED_DONE_KEY]);
+    return true;
+  }
+
+  // Cron flush: drain up to MAX_BATCH pending URLs and POST them. Atomic in the DO.
   async flush() {
     const pending = await this.storage.list({ prefix: PENDING_PREFIX, limit: MAX_BATCH });
-    if (pending.size === 0) return; // nothing pending -> don't trigger the endpoint
+    if (pending.size === 0) return;
 
     const keys = [...pending.keys()];
     const urls = [...new Set([...pending.values()].filter(Boolean))];
 
     if (urls.length === 0) {
-      await this.storage.delete(keys); // stray keys with no value -> clean up and stop
+      await this.storage.delete(keys);
       return;
     }
-
     const ok = await postBatch(urls, this.env);
-    if (ok) {
-      // Clear only what we listed. Anything that arrived since stays for the next run.
-      await this.storage.delete(keys);
-    }
-    // On failure we keep the list; the next cron run retries. Nothing is lost.
+    if (ok) await this.storage.delete(keys);
   }
 }
 
 // Resolve the one coordinator instance.
 function coordinator(env) {
-  const id = env.SCHEMA_DO.idFromName(DO_NAME);
-  return env.SCHEMA_DO.get(id);
+  return env.SCHEMA_DO.get(env.SCHEMA_DO.idFromName(DO_NAME));
+}
+
+// --- One seed batch: read list -> scan next window -> baseline the gaps -----
+async function runSeedBatch(env, stub) {
+  const state = await stub.seedState();
+  if (state.done) return;                       // baseline pass already complete -> no-op
+
+  const urls = await readAllUrls(env);
+  const total = urls.length;
+  const start = Math.min(state.cursor, total);
+  const window = urls.slice(start, start + SEED_BATCH).map(normalizeUrl).filter(Boolean);
+  const newCursor = start + Math.min(SEED_BATCH, Math.max(0, total - start));
+
+  // Only fetch the ones that don't already have a baseline.
+  const todo = window.length ? await stub.unbaselined(window) : [];
+  let pairs = [];
+  if (todo.length) {
+    const results = await mapLimit(todo, SEED_CONCURRENCY, async (u) => {
+      try { return await hashPage(u, env); }
+      catch (e) { console.error("[seed] skip", u, e.message); return null; }
+    });
+    pairs = results.filter(Boolean);
+  }
+
+  const done = await stub.commitSeed(pairs, newCursor, total);
+  console.log(`[seed] ${start}->${newCursor}/${total}, baselined ${pairs.length}, done=${done}`);
 }
 
 // --- Background inspection (runs in waitUntil; never blocks the response) ----
@@ -213,10 +308,7 @@ async function inspect(rawUrl, clonedResponse, env, ctx) {
     const url = normalizeUrl(rawUrl);
     if (!url) return;
 
-    // Per-colo throttle (Cache API). This is now purely a load-reducer in front of the
-    // DO: it caps how often a hot page is re-hashed and how often we touch the DO. The
-    // DO stays the single source of truth for whether the schema actually changed, so
-    // it's fine that this marker is per-colo and only eventually consistent.
+    // Per-colo throttle (Cache API): a load-reducer in front of the DO.
     const cache = caches.default;
     const throttleKey = new Request("https://throttle.local/" + encodeURIComponent(url));
     if (await cache.match(throttleKey)) return;
@@ -227,8 +319,6 @@ async function inspect(rawUrl, clonedResponse, env, ctx) {
       )
     );
 
-    // Hash here (work is spread across colos, not concentrated in the single DO), then
-    // hand the small {url, hash} pair to the coordinator for the consistent compare.
     const hash = await sha256Hex(canonicalizeBlocks(await extractJsonLd(clonedResponse)));
     await coordinator(env).record(url, hash);
   } catch (e) {
@@ -237,12 +327,28 @@ async function inspect(rawUrl, clonedResponse, env, ctx) {
 }
 
 export default {
-  // In-path detector.
   async fetch(request, env, ctx) {
-    // fetch(request) on the incoming request goes to origin, NOT back through this
-    // Worker, so the pass-through proxy doesn't loop.
-    const response = await fetch(request);
+    const u = new URL(request.url);
 
+    // Authenticated control route for the seeder.
+    //   GET /__schema-seed                 -> { cursor, total, done }
+    //   GET /__schema-seed?action=reset    -> restart the baseline pass
+    // Guard with the WORKER_AUTH secret (deny if it isn't set).
+    if (u.pathname === "/__schema-seed") {
+      const provided = request.headers.get("x-worker-auth") || "";
+      if (!env.WORKER_AUTH || provided !== env.WORKER_AUTH) {
+        return new Response("forbidden", { status: 403 });
+      }
+      const stub = coordinator(env);
+      if (u.searchParams.get("action") === "reset") {
+        await stub.resetSeed();
+        return Response.json({ ok: true, action: "reset" });
+      }
+      return Response.json(await stub.seedState());
+    }
+
+    // In-path detector. fetch(request) goes to origin, NOT back through this Worker.
+    const response = await fetch(request);
     if (request.method === "GET" && response.ok) {
       const ct = (response.headers.get("content-type") || "").toLowerCase();
       if (ct.includes("text/html")) {
@@ -252,9 +358,15 @@ export default {
     return response;
   },
 
-  // Cron Trigger: the DO owns the pending list and does the flush atomically, so we
-  // just poke it. If there's nothing pending, flush() returns immediately.
+  // Cron Trigger: seed a batch (until the baseline pass is done), then flush.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(coordinator(env).flush());
+    const stub = coordinator(env);
+    ctx.waitUntil(
+      (async () => {
+        try { await runSeedBatch(env, stub); }
+        catch (e) { console.error("[seed] batch error:", e); }
+        await stub.flush();
+      })()
+    );
   },
 };

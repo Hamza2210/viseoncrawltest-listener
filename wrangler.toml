@@ -1,0 +1,48 @@
+# Config for the GitHub -> Cloudflare deploy. The git build integration runs
+# `wrangler deploy` with this file, which creates the Durable Object via the
+# migration below. (A Durable Object can't be created by pasting code in the
+# dashboard — it needs a migration, so deploy via Wrangler / the git build.)
+name = "schema-change-detector"
+main = "src/index.js"
+compatibility_date = "2025-06-01"
+
+# Runs on EVERY request to the zone. Domain must be proxied (orange-clouded) here.
+routes = [
+  { pattern = "viseoncrawltest.uk/*", zone_name = "viseoncrawltest.uk" }
+]
+
+# The flush schedule — your "every x". `0 * * * *` = once an hour, on the hour.
+[triggers]
+crons = ["0 * * * *"]
+
+# Durable Object: the single strongly-consistent coordinator. It REPLACES the old KV
+# namespace entirely — it holds both the per-URL hashes and the pending list.
+[durable_objects]
+bindings = [
+  { name = "SCHEMA_DO", class_name = "SchemaCoordinator" }
+]
+
+# DOs are created through a migration. `new_sqlite_classes` = the modern SQLite-backed
+# storage (the current default; also works on the free plan). Keep this tag forever;
+# only add a NEW [[migrations]] block with a new tag if you later rename/delete the class.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SchemaCoordinator"]
+
+# Non-secret config (plaintext vars in the dashboard, or committed here).
+[vars]
+ENDPOINT_URL = "https://sggvx2wk8k.execute-api.eu-west-1.amazonaws.com/dev/enqueue-singlepage"
+AWS_REGION = "eu-west-1"
+S3_BUCKET = "funnyseo"
+S3_KEY = "ecs/viseoncrawltest"
+S3_PAGES_KEY = "ecs/viseoncrawltest/pages"
+S3_DOMAIN_KEY = "ecs/viseoncrawltest"
+S3_URLS_KEY = "ecs/viseoncrawltest/all_urls.json"
+NOTIFY_EMAIL = ""
+ENQUEUE_NEW_PAGES = "true"
+
+# Secrets — do NOT put these in this file (it's in your repo). Add them as encrypted
+# secrets in the dashboard (Worker -> Settings -> Variables and Secrets) or via
+# `wrangler secret put <NAME>`:
+#   API_KEY, AWS_ACCESS_KEY, AWS_SECRET_KEY,
+#   QLIK_AUTOMATION, QLIK_TENANT, QLIK_BEARER, WORKER_AUTH

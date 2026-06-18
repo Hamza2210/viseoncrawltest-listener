@@ -1,29 +1,27 @@
 /**
- * Schema-change detector (in-path) + a Durable Object coordinator.
+ * Schema-change detector — PROXY model (sits in front of your existing site).
  * ----------------------------------------------------------------------------
- * Pieces:
+ * This Worker does NOT serve your pages. Your existing static worker keeps serving
+ * them on its Custom Domain. This Worker is attached to a ROUTE on the same hostname;
+ * per Cloudflare routing, a route takes precedence over a custom domain, and your
+ * OTHER workers' more-specific routes (e.g. /api/*) take precedence over this one — so
+ * they are untouched. This Worker only handles page paths no other route claims.
  *
- *   fetch()            — in-path detector. Proxies each request to origin and returns
- *                        it UNTOUCHED, then inspects a clone in the background. On a
- *                        real JSON-LD change it hands {url, hash} to the coordinator DO.
- *                        Also exposes a small authenticated control route for the seeder
- *                        (see "/__schema-seed" below).
+ *   fetch()            — proxies each request to origin via fetch(request) (which, on
+ *                        this same zone, invokes your static worker / origin), returns
+ *                        it UNTOUCHED, and inspects a clone in the background. On a real
+ *                        JSON-LD change it hands {url, hash} to the coordinator DO.
+ *                        Also exposes the seeder's control route at "/__schema-seed".
  *
- *   SchemaCoordinator  — the Durable Object. ONE strongly-consistent, single-threaded
- *                        instance owns ALL state: per-URL hashes, the pending list, and
- *                        the seeder's cursor. Pure storage — no network I/O lives here.
+ *   SchemaCoordinator  — Durable Object. One strongly-consistent instance owns all
+ *                        state: per-URL hashes, the pending list, the seed cursor.
  *
- *   scheduled()        — the Cron Trigger. Each tick: (1) run one SEED batch if the
- *                        initial baseline pass isn't finished, then (2) flush the pending
- *                        list. The seed step is a no-op once seeding is complete.
+ *   scheduled()        — Cron Trigger. Each tick: one SEED batch (until the baseline
+ *                        pass is complete), then flush the pending list.
  *
- * SEEDING (the baseline pass):
- *   The in-path detector can only hash pages that actually receive traffic. To baseline
- *   a whole domain without hand-visiting every page, the seeder reads your master URL
- *   list (all_urls.json at S3_URLS_KEY), fetches each URL through the SAME hash path the
- *   detector uses, and writes a baseline-only hash to the DO (never enqueues). Run it
- *   with ENQUEUE_NEW_PAGES="false". Once it reports done, flip ENQUEUE_NEW_PAGES="true"
- *   and only genuinely-new pages (absent from the seed) will fire from then on.
+ * SEEDING reads the master URL list (all_urls.json at S3_URLS_KEY) and baselines each
+ * page through the SAME proxied fetch path live traffic uses. Run with
+ * ENQUEUE_NEW_PAGES="false"; once it reports done, flip to "true".
  *
  * Set RESERVED CONCURRENCY = 1 on the singlepage Lambda so two parquet merges never
  * overlap (the endpoint invokes the Lambda asynchronously).
@@ -41,9 +39,9 @@ const SEED_CONCURRENCY = 10;  // parallel page fetches within a seed batch
 
 const HASH_PREFIX = "hash:";       // hash:<sha(url)>     -> last-seen schema hash
 const PENDING_PREFIX = "pending:"; // pending:<sha(url)>  -> changed URL awaiting flush
-const SEED_CURSOR_KEY = "seed:cursor"; // how far through all_urls.json we've scanned
-const SEED_TOTAL_KEY = "seed:total";   // length of the list at last commit
-const SEED_DONE_KEY = "seed:done";     // true once cursor has covered the whole list
+const SEED_CURSOR_KEY = "seed:cursor";
+const SEED_TOTAL_KEY = "seed:total";
+const SEED_DONE_KEY = "seed:done";
 
 const DO_NAME = "coordinator"; // one coordinator instance per deployment
 
@@ -110,14 +108,11 @@ async function sha256Hex(str) {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// --- Fetch a page and compute its schema hash (the shared hash path) --------
-// Used by BOTH the in-path detector (indirectly) and the seeder, so baselines match
-// exactly what live traffic produces. Returns { url (normalised), hash } or throws.
+// --- Fetch a page (proxied to origin) and compute its schema hash -----------
 async function hashPage(rawUrl, env) {
   const url = normalizeUrl(rawUrl);
   if (!url) return null;
-  // Fetching a URL on this same zone goes to ORIGIN, not back through this Worker,
-  // so there's no loop and the in-path detector isn't re-triggered.
+  // fetch() to this same zone invokes the origin (your static worker), not this Worker.
   const res = await fetch(url, { headers: crawlerHeaders(env) });
   if (!res.ok) throw new Error(`fetch ${res.status}`);
   const hash = await sha256Hex(canonicalizeBlocks(await extractJsonLd(res)));
@@ -132,8 +127,8 @@ async function readAllUrls(env) {
     region: env.AWS_REGION,
     service: "s3",
   });
-  // Virtual-hosted-style endpoint. If your bucket name contains dots, switch to
-  // path-style: `https://s3.${env.AWS_REGION}.amazonaws.com/${env.S3_BUCKET}/${env.S3_URLS_KEY}`
+  // Virtual-hosted-style. Dotted bucket name? Use path-style:
+  //   `https://s3.${env.AWS_REGION}.amazonaws.com/${env.S3_BUCKET}/${env.S3_URLS_KEY}`
   const endpoint =
     `https://${env.S3_BUCKET}.s3.${env.AWS_REGION}.amazonaws.com/${env.S3_URLS_KEY}`;
   const res = await aws.fetch(endpoint, { method: "GET" });
@@ -143,7 +138,7 @@ async function readAllUrls(env) {
   return data.filter((u) => typeof u === "string" && u.trim());
 }
 
-// --- Bounded-concurrency map (cap simultaneous page fetches) ----------------
+// --- Bounded-concurrency map ------------------------------------------------
 async function mapLimit(items, limit, fn) {
   const out = new Array(items.length);
   let i = 0;
@@ -202,7 +197,6 @@ export class SchemaCoordinator extends DurableObject {
     this.env = env;
   }
 
-  // In-path detector path: atomic compare-and-set + pending write.
   async record(url, hash) {
     const urlKey = await sha256Hex(url);
     const stored = await this.storage.get(HASH_PREFIX + urlKey);
@@ -210,13 +204,10 @@ export class SchemaCoordinator extends DurableObject {
     if (stored === hash) return;                          // unchanged
     await this.storage.put(HASH_PREFIX + urlKey, hash);   // persist baseline
 
-    // First-ever sighting. DO storage returns `undefined` for a missing key.
     if (stored === undefined && this.env.ENQUEUE_NEW_PAGES === "false") return;
 
     await this.storage.put(PENDING_PREFIX + urlKey, url); // dedup by key
   }
-
-  // Seeder support -----------------------------------------------------------
 
   async seedState() {
     const cursor = (await this.storage.get(SEED_CURSOR_KEY)) || 0;
@@ -225,8 +216,6 @@ export class SchemaCoordinator extends DurableObject {
     return { cursor, total, done };
   }
 
-  // Of the given (already-normalised) URLs, return only those with NO baseline yet.
-  // Lets the seeder skip pages live traffic has already baselined — no wasted fetch.
   async unbaselined(urls) {
     const out = [];
     for (const url of urls) {
@@ -236,7 +225,6 @@ export class SchemaCoordinator extends DurableObject {
     return out;
   }
 
-  // Write baseline hashes (NEVER enqueues) and advance the cursor. Returns done flag.
   async commitSeed(pairs, newCursor, total) {
     for (const { url, hash } of pairs) {
       await this.storage.put(HASH_PREFIX + (await sha256Hex(url)), hash);
@@ -248,13 +236,11 @@ export class SchemaCoordinator extends DurableObject {
     return done;
   }
 
-  // Re-run the baseline pass from the top (e.g. after adding many new pages).
   async resetSeed() {
     await this.storage.delete([SEED_CURSOR_KEY, SEED_TOTAL_KEY, SEED_DONE_KEY]);
     return true;
   }
 
-  // Cron flush: drain up to MAX_BATCH pending URLs and POST them. Atomic in the DO.
   async flush() {
     const pending = await this.storage.list({ prefix: PENDING_PREFIX, limit: MAX_BATCH });
     if (pending.size === 0) return;
@@ -271,15 +257,14 @@ export class SchemaCoordinator extends DurableObject {
   }
 }
 
-// Resolve the one coordinator instance.
 function coordinator(env) {
   return env.SCHEMA_DO.get(env.SCHEMA_DO.idFromName(DO_NAME));
 }
 
-// --- One seed batch: read list -> scan next window -> baseline the gaps -----
+// --- One seed batch ---------------------------------------------------------
 async function runSeedBatch(env, stub) {
   const state = await stub.seedState();
-  if (state.done) return;                       // baseline pass already complete -> no-op
+  if (state.done) return;
 
   const urls = await readAllUrls(env);
   const total = urls.length;
@@ -287,7 +272,6 @@ async function runSeedBatch(env, stub) {
   const window = urls.slice(start, start + SEED_BATCH).map(normalizeUrl).filter(Boolean);
   const newCursor = start + Math.min(SEED_BATCH, Math.max(0, total - start));
 
-  // Only fetch the ones that don't already have a baseline.
   const todo = window.length ? await stub.unbaselined(window) : [];
   let pairs = [];
   if (todo.length) {
@@ -308,7 +292,6 @@ async function inspect(rawUrl, clonedResponse, env, ctx) {
     const url = normalizeUrl(rawUrl);
     if (!url) return;
 
-    // Per-colo throttle (Cache API): a load-reducer in front of the DO.
     const cache = caches.default;
     const throttleKey = new Request("https://throttle.local/" + encodeURIComponent(url));
     if (await cache.match(throttleKey)) return;
@@ -330,10 +313,7 @@ export default {
   async fetch(request, env, ctx) {
     const u = new URL(request.url);
 
-    // Authenticated control route for the seeder.
-    //   GET /__schema-seed                 -> { cursor, total, done }
-    //   GET /__schema-seed?action=reset    -> restart the baseline pass
-    // Guard with the WORKER_AUTH secret (deny if it isn't set).
+    // Authenticated seeder control route (guarded by the WORKER_AUTH secret).
     if (u.pathname === "/__schema-seed") {
       const provided = request.headers.get("x-worker-auth") || "";
       if (!env.WORKER_AUTH || provided !== env.WORKER_AUTH) {
@@ -347,7 +327,7 @@ export default {
       return Response.json(await stub.seedState());
     }
 
-    // In-path detector. fetch(request) goes to origin, NOT back through this Worker.
+    // Proxy to origin (your static worker), return untouched, inspect a clone.
     const response = await fetch(request);
     if (request.method === "GET" && response.ok) {
       const ct = (response.headers.get("content-type") || "").toLowerCase();
@@ -358,7 +338,6 @@ export default {
     return response;
   },
 
-  // Cron Trigger: seed a batch (until the baseline pass is done), then flush.
   async scheduled(event, env, ctx) {
     const stub = coordinator(env);
     ctx.waitUntil(
